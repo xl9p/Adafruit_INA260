@@ -31,6 +31,8 @@
  *     v1.0 - First release
  */
 
+
+
 #include "Arduino.h"
 #include <Wire.h>
 
@@ -39,290 +41,354 @@
 /*!
  *    @brief  Instantiates a new INA260 class
  */
-Adafruit_INA260::Adafruit_INA260(void) {}
+Adafruit_INA260::Adafruit_INA260(TwoWire *theWire, uint8_t i2cAddress) {
+  this->i2cDevice = std::make_unique<Adafruit_I2CDevice>(i2cAddress, theWire);
+
+  this->configReg.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::CONFIG, 2, MSBFIRST);
+  this->maskEnableReg.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::MASK_ENABLE, 2, MSBFIRST);
+  this->alertLimitReg.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::ALERT_LIMIT, 2, MSBFIRST);
+
+  this->currentReg.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::CURRENT, 2, MSBFIRST);
+  this->votlageReg.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::BUSVOLTAGE, 2, MSBFIRST);
+  this->powerReg.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::POWER, 2, MSBFIRST);
+
+  this->dieRegister.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::DIE_UID, 2, MSBFIRST);
+  this->mfgRegister.emplace(this->i2cDevice.get(), (uint8_t) INA260_REGISTERS::MFG_UID, 2, MSBFIRST);
+}
 
 /*!
  *    @brief  Sets up the HW
- *    @param  i2c_address
- *            The I2C address to be used.
- *    @param  theWire
- *            The Wire object to be used for I2C connections.
+ *    @param  i2c_address The I2C address to be used.
+ *    @param  theWire The Wire object to be used for I2C connections.
  *    @return True if initialization was successful, otherwise false.
  */
-bool Adafruit_INA260::begin(uint8_t i2c_address, TwoWire *theWire) {
-  i2c_dev = new Adafruit_I2CDevice(i2c_address, theWire);
+INA260SensorOperation Adafruit_INA260::begin(const INA260_Config &sensorConfig) {
+  if (!this->isInitialized) {
+    if (!this->i2cDevice->begin()) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    
 
-  if (!i2c_dev->begin()) {
-    return false;
+    Adafruit_BusIO_RegisterBits deviceId = Adafruit_BusIO_RegisterBits(&this->dieRegister.value(), 12, (uint8_t)INA260_DIE_UID_OFFSETS::DID);
+
+    uint32_t mfg = this->mfgRegister.value().read();
+    uint32_t devId = deviceId.read();
+
+    // make sure we're talking to the right chip
+    if ((mfg != (uint16_t)INA260_DEFINITIONS::MANUFACTURER_ID) || (devId != (uint16_t)INA260_DEFINITIONS::DEVICE_ID)) {
+      return INA260SensorOperation(SENSOR_STATUS_BAD_ADDR);
+    }
+
+
+    bool configModeRes = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U,
+                        (uint8_t) INA260_CONFIG_OFFSETS::MODE).write((uint8_t)sensorConfig.mode);
+    bool configAvgRes = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U,
+                        (uint8_t) INA260_CONFIG_OFFSETS::AVG).write((uint8_t)sensorConfig.averagingCount);
+    bool configVbusCTRes = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U,
+                        (uint8_t) INA260_CONFIG_OFFSETS::VBUSCT).write((uint8_t)sensorConfig.voltageConversionTime);
+    bool configCCTRes = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U,
+                        (uint8_t) INA260_CONFIG_OFFSETS::ISHCT).write((uint8_t)sensorConfig.currentConversionTime);
+    bool maskEnableLEnableRes = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 1U,
+                        (uint8_t) INA260_MASK_ENABLE_OFFSETS::LEN).write((uint8_t)sensorConfig.alertLatchState);
+    bool maskEnableLTypeRes = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 6U,
+                        (uint8_t) INA260_MASK_ENABLE_OFFSETS::CNVR).write((uint8_t)sensorConfig.alertLatchType);
+    bool maskEnableLPolarityRes = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 1U,
+                        (uint8_t) INA260_MASK_ENABLE_OFFSETS::APOL).write((uint8_t)sensorConfig.alertLatchPolarity);
+
+    bool maskEnableAlertLimitRes = Adafruit_BusIO_RegisterBits(&this->alertLimitReg.value(), 16U, 0U).write((int16_t)(sensorConfig.alertThreshold / 1.25f));
+
+    if (!(configModeRes && configAvgRes && configVbusCTRes && configCCTRes && maskEnableLEnableRes && maskEnableLTypeRes && maskEnableLPolarityRes && maskEnableAlertLimitRes)) {
+      return INA260SensorOperation(SENSOR_STATUS_CONFIG_SET_FAIL);
+    }
+
+    this->configuration = sensorConfig;
+    this->isInitialized = true;
+
+    switch(this->reset().sensorStatus) {
+      case SENSOR_STATUS_OP_OK: {
+        return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+      }
+      default: {
+        this->isInitialized = false;
+				return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+      }
+    }
   }
-
-  Adafruit_I2CRegister *die_register =
-      new Adafruit_I2CRegister(i2c_dev, INA260_REG_DIE_UID, 2, MSBFIRST);
-  Adafruit_I2CRegister *mfg_register =
-      new Adafruit_I2CRegister(i2c_dev, INA260_REG_MFG_UID, 2, MSBFIRST);
-  Adafruit_I2CRegisterBits *device_id =
-      new Adafruit_I2CRegisterBits(die_register, 12, 4);
-
-  // make sure we're talking to the right chip
-  if ((mfg_register->read() != 0x5449) || (device_id->read() != 0x227)) {
-    return false;
-  }
-
-  Config = new Adafruit_I2CRegister(i2c_dev, INA260_REG_CONFIG, 2, MSBFIRST);
-  MaskEnable =
-      new Adafruit_I2CRegister(i2c_dev, INA260_REG_MASK_ENABLE, 2, MSBFIRST);
-  AlertLimit =
-      new Adafruit_I2CRegister(i2c_dev, INA260_REG_ALERT_LIMIT, 2, MSBFIRST);
-
-  reset();
-  delay(2); // delay 2ms to give time for first measurement to finish
-  return true;
+  return INA260SensorOperation(SENSOR_STATUS_ALREADY_INIT);
 }
-/**************************************************************************/
-/*!
-    @brief Resets the harware. All registers are set to default values,
-    the same as a power-on reset.
-*/
-/**************************************************************************/
-void Adafruit_INA260::reset(void) {
-  Adafruit_I2CRegisterBits reset = Adafruit_I2CRegisterBits(Config, 1, 15);
-  reset.write(1);
-}
-/**************************************************************************/
+
+
 /*!
     @brief Reads and scales the current value of the Current register.
     @return The current current measurement in mA
 */
-/**************************************************************************/
-float Adafruit_INA260::readCurrent(void) {
-  Adafruit_I2CRegister current =
-      Adafruit_I2CRegister(i2c_dev, INA260_REG_CURRENT, 2, MSBFIRST);
-  return (int16_t)current.read() * 1.25;
+INA260SensorOperation Adafruit_INA260::readCurrent(void) {
+  if (this->isInitialized) {
+    uint32_t rawData = this->currentReg.value().read();
+
+    if (rawData == 0xFFFFFFFF) {
+      return INA260SensorOperation(SENSOR_STATUS_DATA_BAD);
+    }
+
+    return INA260SensorOperation(SENSOR_STATUS_DATA_OK, ((int16_t)rawData * 1.25f));
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
+
+
 /*!
     @brief Reads and scales the current value of the Bus Voltage register.
     @return The current bus voltage measurement in mV
 */
-/**************************************************************************/
-float Adafruit_INA260::readBusVoltage(void) {
-  Adafruit_I2CRegister bus_voltage =
-      Adafruit_I2CRegister(i2c_dev, INA260_REG_BUSVOLTAGE, 2, MSBFIRST);
-  return bus_voltage.read() * 1.25;
+INA260SensorOperation Adafruit_INA260::readVoltage(void) {
+  if (this->isInitialized) {
+    uint32_t rawData = this->votlageReg.value().read();
+
+    if (rawData == 0xFFFFFFFF) {
+      return INA260SensorOperation(SENSOR_STATUS_DATA_BAD);
+    }
+
+    return INA260SensorOperation(SENSOR_STATUS_DATA_OK, ((int16_t)rawData * 1.25f));
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
+
+
 /*!
     @brief Reads and scales the current value of the Power register.
     @return The current Power calculation in mW
 */
-/**************************************************************************/
-float Adafruit_INA260::readPower(void) {
-  Adafruit_I2CRegister power =
-      Adafruit_I2CRegister(i2c_dev, INA260_REG_POWER, 2, MSBFIRST);
-  return power.read() * 10;
-}
-/**************************************************************************/
-/*!
-    @brief Returns the current measurement mode
-    @return The current mode
-*/
-/**************************************************************************/
-INA260_MeasurementMode Adafruit_INA260::getMode(void) {
-  Adafruit_I2CRegisterBits mode = Adafruit_I2CRegisterBits(Config, 3, 0);
-  return (INA260_MeasurementMode)mode.read();
-}
-/**************************************************************************/
-/*!
-    @brief Sets a new measurement mode
-    @param new_mode
-           The new mode to be set
-*/
-/**************************************************************************/
-void Adafruit_INA260::setMode(INA260_MeasurementMode new_mode) {
-  Adafruit_I2CRegisterBits mode = Adafruit_I2CRegisterBits(Config, 3, 0);
-  mode.write(new_mode);
-}
-/**************************************************************************/
-/*!
-    @brief Reads the current number of averaging samples
-    @return The current number of averaging samples
-*/
-/**************************************************************************/
-INA260_AveragingCount Adafruit_INA260::getAveragingCount(void) {
-  Adafruit_I2CRegisterBits averaging_count =
-      Adafruit_I2CRegisterBits(Config, 3, 9);
-  return (INA260_AveragingCount)averaging_count.read();
-}
-/**************************************************************************/
-/*!
-    @brief Sets the number of averaging samples
-    @param count
-           The number of samples to be averaged
-*/
-/**************************************************************************/
-void Adafruit_INA260::setAveragingCount(INA260_AveragingCount count) {
-  Adafruit_I2CRegisterBits averaging_count =
-      Adafruit_I2CRegisterBits(Config, 3, 9);
-  averaging_count.write(count);
-}
-/**************************************************************************/
-/*!
-    @brief Reads the current current conversion time
-    @return The current current conversion time
-*/
-/**************************************************************************/
-INA260_ConversionTime Adafruit_INA260::getCurrentConversionTime(void) {
-  Adafruit_I2CRegisterBits current_conversion_time =
-      Adafruit_I2CRegisterBits(Config, 3, 3);
-  return (INA260_ConversionTime)current_conversion_time.read();
-}
-/**************************************************************************/
-/*!
-    @brief Sets the current conversion time
-    @param time
-           The new current conversion time
-*/
-/**************************************************************************/
-void Adafruit_INA260::setCurrentConversionTime(INA260_ConversionTime time) {
-  Adafruit_I2CRegisterBits current_conversion_time =
-      Adafruit_I2CRegisterBits(Config, 3, 3);
-  current_conversion_time.write(time);
-}
-/**************************************************************************/
-/*!
-    @brief Reads the current bus voltage conversion time
-    @return The current bus voltage conversion time
-*/
-/**************************************************************************/
-INA260_ConversionTime Adafruit_INA260::getVoltageConversionTime(void) {
-  Adafruit_I2CRegisterBits voltage_conversion_time =
-      Adafruit_I2CRegisterBits(Config, 3, 6);
-  return (INA260_ConversionTime)voltage_conversion_time.read();
-}
-/**************************************************************************/
-/*!
-    @brief Sets the bus voltage conversion time
-    @param time
-           The new bus voltage conversion time
-*/
-/**************************************************************************/
-void Adafruit_INA260::setVoltageConversionTime(INA260_ConversionTime time) {
-  Adafruit_I2CRegisterBits voltage_conversion_time =
-      Adafruit_I2CRegisterBits(Config, 3, 6);
-  voltage_conversion_time.write(time);
+INA260SensorOperation Adafruit_INA260::readPower(void) {
+  if (this->isInitialized) {
+    uint32_t rawData = this->powerReg.value().read();
+
+    if (rawData == 0xFFFFFFFF) {
+      return INA260SensorOperation(SENSOR_STATUS_DATA_BAD);
+    }
+
+    return INA260SensorOperation(SENSOR_STATUS_DATA_OK, ((int16_t)rawData * 10.0f));
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
 
-/**************************************************************************/
+
+/*!
+    @brief Resets the harware. 
+    All registers are set to default values, the same as a power-on reset.
+*/
+INA260SensorOperation Adafruit_INA260::reset(void) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits reset = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 1U, (uint8_t)INA260_CONFIG_OFFSETS::RESET);
+    if (!reset.write(1)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    delay(5);
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+INA260SensorOperation Adafruit_INA260::end(void) {
+  if (this->isInitialized) {
+    
+    return INA260SensorOperation(SENSOR_STATUS_NOT_IMPLEMENTED);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+
+/*!
+    @brief Sets a new measurement mode
+    @param new_mode The new mode to be set
+*/
+INA260SensorOperation Adafruit_INA260::setMode(INA260_MeasurementMode new_mode) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits mode = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U, (uint8_t)INA260_CONFIG_OFFSETS::MODE);
+    if (!mode.write((uint8_t)new_mode)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.mode = new_mode;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+
+/*!
+    @brief Sets the number of averaging samples
+    @param count The number of samples to be averaged
+*/
+INA260SensorOperation Adafruit_INA260::setAveragingCount(INA260_AveragingCount count) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits averaging_count = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U, (uint8_t)INA260_CONFIG_OFFSETS::AVG);
+    if (!averaging_count.write((uint8_t)count)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.averagingCount = count;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+
+/*!
+    @brief Sets the current conversion time
+    @param time The new current conversion time
+*/
+INA260SensorOperation Adafruit_INA260::setCurrentConversionTime(INA260_ConversionTime time) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits current_conversion_time = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U, (uint8_t)INA260_CONFIG_OFFSETS::ISHCT);
+    if (!current_conversion_time.write((uint8_t)time)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.currentConversionTime = time;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+
+/*!
+    @brief Sets the bus voltage conversion time
+    @param time The new bus voltage conversion time
+*/
+INA260SensorOperation Adafruit_INA260::setVoltageConversionTime(INA260_ConversionTime time) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits voltage_conversion_time = Adafruit_BusIO_RegisterBits(&this->configReg.value(), 3U, (uint8_t)INA260_CONFIG_OFFSETS::VBUSCT);
+    if (!voltage_conversion_time.write((uint8_t)time)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.voltageConversionTime = time;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+
 /*!
     @brief Checks if the most recent one shot measurement has completed
     @return true if the conversion has completed
 */
-/**************************************************************************/
-bool Adafruit_INA260::conversionReady(void) {
-  Adafruit_I2CRegisterBits conversion_ready =
-      Adafruit_I2CRegisterBits(MaskEnable, 1, 3);
-  return conversion_ready.read();
+INA260SensorOperation Adafruit_INA260::conversionReady(void) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits conversion_ready = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 1U, (uint8_t)INA260_MASK_ENABLE_OFFSETS::CVRF);
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK, (bool)conversion_ready.read());
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
-/*!
-    @brief Reads the current parameter that asserts the ALERT pin
-    @return The current parameter that asserts the ALERT PIN
-*/
-/**************************************************************************/
-INA260_AlertType Adafruit_INA260::getAlertType(void) {
-  Adafruit_I2CRegisterBits alert_type =
-      Adafruit_I2CRegisterBits(MaskEnable, 6, 10);
-  return (INA260_AlertType)alert_type.read();
-}
-/**************************************************************************/
+
+
 /*!
     @brief Sets which parameter asserts the ALERT pin
-    @param alert
-           The parameter which asserts the ALERT pin
+    @param alert The parameter which asserts the ALERT pin
+    @note The method writes 6 different offsets at a time.
 */
-/**************************************************************************/
-void Adafruit_INA260::setAlertType(INA260_AlertType alert) {
-  Adafruit_I2CRegisterBits alert_type =
-      Adafruit_I2CRegisterBits(MaskEnable, 6, 10);
-  alert_type.write(alert);
+INA260SensorOperation Adafruit_INA260::setAlertType(INA260_AlertType alert) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits alert_type = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 6U, (uint8_t)INA260_MASK_ENABLE_OFFSETS::CNVR);
+    if (!alert_type.write((uint8_t)alert)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.alertLatchType = alert;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
-/*!
-    @brief Reads the current alert limit setting
-    @return The current bus alert limit setting
-*/
-/**************************************************************************/
-float Adafruit_INA260::getAlertLimit(void) {
-  Adafruit_I2CRegisterBits alert_limit =
-      Adafruit_I2CRegisterBits(AlertLimit, 16, 0);
-  return (float)alert_limit.read() * 1.25;
-}
-/**************************************************************************/
+
+
 /*!
     @brief Sets the Alert Limit
-    @param limit
-           The new limit that triggers the alert
+    @param limit The new limit that triggers the alert
 */
-/**************************************************************************/
-void Adafruit_INA260::setAlertLimit(float limit) {
-  Adafruit_I2CRegisterBits alert_limit =
-      Adafruit_I2CRegisterBits(AlertLimit, 16, 0);
-  alert_limit.write((int16_t)(limit / 1.25));
+INA260SensorOperation Adafruit_INA260::setAlertLimit(float limit) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits alert_limit = Adafruit_BusIO_RegisterBits(&this->alertLimitReg.value(), 16U, 0U);
+    if (!alert_limit.write((int16_t)(limit / 1.25f))) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.alertThreshold = limit;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
-/*!
-    @brief Reads the current alert polarity setting
-    @return The current bus alert polarity setting
-*/
-/**************************************************************************/
-INA260_AlertPolarity Adafruit_INA260::getAlertPolarity(void) {
-  Adafruit_I2CRegisterBits alert_polarity =
-      Adafruit_I2CRegisterBits(MaskEnable, 1, 1);
-  return (INA260_AlertPolarity)alert_polarity.read();
-}
-/**************************************************************************/
+
+
 /*!
     @brief Sets Alert Polarity Bit
-    @param polarity
-           The polarity of the alert pin
+    @param polarity The polarity of the alert pin
 */
-/**************************************************************************/
-void Adafruit_INA260::setAlertPolarity(INA260_AlertPolarity polarity) {
-  Adafruit_I2CRegisterBits alert_polarity =
-      Adafruit_I2CRegisterBits(MaskEnable, 1, 1);
-  alert_polarity.write(polarity);
+INA260SensorOperation Adafruit_INA260::setAlertPolarity(INA260_AlertPolarity polarity) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits alert_polarity = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 1U, (uint8_t)INA260_MASK_ENABLE_OFFSETS::APOL);
+    if (!alert_polarity.write((uint8_t)polarity)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.alertLatchPolarity = polarity;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
-/*!
-    @brief Reads the current alert latch setting
-    @return The current bus alert latch setting
-*/
-/**************************************************************************/
-INA260_AlertLatch Adafruit_INA260::getAlertLatch(void) {
-  Adafruit_I2CRegisterBits alert_latch =
-      Adafruit_I2CRegisterBits(MaskEnable, 1, 0);
-  return (INA260_AlertLatch)alert_latch.read();
-}
-/**************************************************************************/
+
+
 /*!
     @brief Sets Alert Latch Bit
-    @param state
-           The parameter which asserts the ALERT pin
+    @param state The parameter which asserts the ALERT pin
 */
-/**************************************************************************/
-void Adafruit_INA260::setAlertLatch(INA260_AlertLatch state) {
-  Adafruit_I2CRegisterBits alert_latch =
-      Adafruit_I2CRegisterBits(MaskEnable, 1, 0);
-  alert_latch.write(state);
+INA260SensorOperation Adafruit_INA260::setAlertLatch(INA260_AlertLatch state) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits alert_latch = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 1U, (uint8_t)INA260_MASK_ENABLE_OFFSETS::LEN);
+    if (!alert_latch.write((uint8_t)state)) {
+      return INA260SensorOperation(SENSOR_STATUS_I2C_FAIL);
+    }
+    this->configuration.alertLatchState = state;
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK);
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
 }
-/**************************************************************************/
+
+
 /*!
     @brief Checks if the Alert Flag is set
     @return true if the flag is set
 */
-/**************************************************************************/
-bool Adafruit_INA260::alertFunctionFlag(void) {
-  Adafruit_I2CRegisterBits alert_function_flag =
-      Adafruit_I2CRegisterBits(MaskEnable, 1, 4);
-  return alert_function_flag.read();
+INA260SensorOperation Adafruit_INA260::alertFunctionFlag(void) {
+  if (this->isInitialized) {
+    Adafruit_BusIO_RegisterBits alert_function_flag = Adafruit_BusIO_RegisterBits(&this->maskEnableReg.value(), 1U, (uint8_t)INA260_MASK_ENABLE_OFFSETS::AFF);
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK, ((bool)alert_function_flag.read()));
+  }
+  return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+}
+
+
+INA260SensorOperation Adafruit_INA260::getConfiguration(bool update) {
+  if (update) {
+    if (this->isInitialized) {
+      // Adafruit_BusIO_RegisterBits(&this->configReg, 3U,
+      //                     (uint8_t) INA260_CONFIG_OFFSETS::MODE).read();
+      // Adafruit_BusIO_RegisterBits(&this->configReg, 3U,
+      //                     (uint8_t) INA260_CONFIG_OFFSETS::AVG).read();
+      // Adafruit_BusIO_RegisterBits(&this->configReg, 3U,
+      //                     (uint8_t) INA260_CONFIG_OFFSETS::VBUSCT).read();
+      // Adafruit_BusIO_RegisterBits(&this->configReg, 3U,
+      //                     (uint8_t) INA260_CONFIG_OFFSETS::ISHCT).read();
+      
+      // Adafruit_BusIO_RegisterBits(&this->maskEnableReg, 1U,
+      //                     (uint8_t) INA260_MASK_ENABLE_OFFSETS::LEN).read();
+      // Adafruit_BusIO_RegisterBits(&this->maskEnableReg, 6U,
+      //                     (uint8_t) INA260_MASK_ENABLE_OFFSETS::CNVR).read();
+      // Adafruit_BusIO_RegisterBits(&this->maskEnableReg, 1U,
+      //                     (uint8_t) INA260_MASK_ENABLE_OFFSETS::APOL).read();
+
+      // Adafruit_BusIO_RegisterBits(&this->alertLimitReg, 16U, 0U).read();
+      return INA260SensorOperation(SENSOR_STATUS_NOT_IMPLEMENTED);
+    }
+    return INA260SensorOperation(SENSOR_STATUS_NOT_INIT);
+  } else {
+    return INA260SensorOperation(SENSOR_STATUS_OP_OK, this->configuration);
+  }
+}
+
+
+Adafruit_INA260::~Adafruit_INA260() {
+
 }

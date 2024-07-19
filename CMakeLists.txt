@@ -8,7 +8,7 @@ if(ESP_PLATFORM)
   idf_component_register(
     SRCS ${ADAFRUIT_INA260} 
     INCLUDE_DIRS src 
-    REQUIRES arduino Adafruit_BusIO
+    REQUIRES arduino Adafruit_BusIO SensorCommon
   )
 
   return()
